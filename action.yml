@@ -1,0 +1,208 @@
+name: Sematext Synthetics CI/CD
+description: "Trigger Sematext Synthetics tests during your CI/CD workflows"
+author: "Sematext"
+
+inputs:
+  MONITOR_GROUP_ID:
+    description: "The ID of the monitor group to run the tests against (example: 42)"
+    required: true
+  REGION:
+    description: "The region where your Sematext Cloud account is located ('EU' or 'US')"
+    required: true
+  SEMATEXT_API_KEY:
+    description: "Your Sematext Cloud account's API key (visible in Settings -> API)"
+    required: true
+  TARGET_URL:
+    description: "The URL to run the Synthetics tests against (optional, will use the URL specified in the Sematext Cloud UI if not provided)"
+    required: false
+  GIT_COMMIT_HASH:
+    description: "The commit hash that the Synthetics tests will be triggered for (optional and used for repository dispatches which aren't directly linked to a commit, will use the commit hash of the current commit if not provided)"
+    required: false
+  USE_HEAD_SHA:
+    description: "Whether to use the HEAD SHA for the Synthetics tests (optional, defaults to false)"
+    required: false
+
+outputs:
+  result:
+    description: "The full result output from the Synthetics tests"
+    value: ${{ steps.poll_results.outputs.result }}
+  status:
+    description: "The status of the tests (passed/failed)"
+    value: ${{ steps.set_base_url.outputs.status || steps.trigger_check.outputs.status || steps.poll_results.outputs.status }}
+  error:
+    description: "The error message if the tests failed"
+    value: ${{ steps.set_base_url.outputs.error || steps.trigger_check.outputs.error || steps.poll_results.outputs.error }}
+  group_run_url:
+    description: "The URL of the Group Run in the Sematext Cloud UI"
+    value: ${{ steps.trigger_check.outputs.group_run_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Extract commit details
+      id: commit_info
+      shell: bash
+      run: |
+        COMMIT_HASH="${{ inputs.GIT_COMMIT_HASH }}"
+        if [[ -n "$COMMIT_HASH" ]]; then
+          echo "::notice::Using commit hash from input: '$COMMIT_HASH'"
+        elif [[ "${{ inputs.USE_HEAD_SHA }}" == "true" ]]; then
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "::notice::No GIT_COMMIT_HASH input provided, using the current commit hash on HEAD: '$COMMIT_HASH'"
+        else
+          echo "::error::No GIT_COMMIT_HASH input provided and use of HEAD SHA isn't specified, exiting."
+          exit 1
+        fi
+
+        # Fetch all remote branches and identify the branch with this commit, if such a branch exists
+        git fetch --all
+        BRANCH_NAME=$(git branch --remote --contains $COMMIT_HASH | grep -oE 'origin/[^ ]+' | sed 's|origin/||' | head -n 1)
+        if [[ -z "$BRANCH_NAME" ]]; then
+          echo "::error::Could not determine branch name for commit hash $COMMIT_HASH, check if the commit is on a remote branch."
+          exit 1
+        fi
+        echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_ENV
+        echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+    - name: Set Sematext base URL
+      id: set_base_url
+      shell: bash
+      run: |
+        if [[ "${{ inputs.REGION }}" == "EU" ]]; then
+          echo "BASE_URL=https://apps.eu.sematext.com/synthetics-api/api" >> $GITHUB_ENV
+          echo "GROUP_RUN_URL=https://apps.eu.sematext.com" >> $GITHUB_ENV
+        elif [[ "${{ inputs.REGION }}" == "US" ]]; then
+          echo "BASE_URL=https://apps.sematext.com/synthetics-api/api" >> $GITHUB_ENV
+          echo "GROUP_RUN_URL=https://apps.sematext.com" >> $GITHUB_ENV
+        else
+          error="Invalid region: '${{ inputs.REGION }}'. Region must be 'EU' or 'US'."
+          echo "::error::$error"
+          echo "error=$error" >> $GITHUB_OUTPUT
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Trigger Sematext Synthetics Check
+      id: trigger_check
+      shell: bash
+      run: |
+        api_url="${{ env.BASE_URL }}/groups/${{ inputs.MONITOR_GROUP_ID }}/runs/github"
+        TARGET_URL="${{ inputs.TARGET_URL }}"
+        if [[ -z "$TARGET_URL" ]]; then
+          echo "::warning::No dynamic TARGET_URL input provided. Attempting to run against the URL specified in the Sematext Cloud UI. If there are monitors with dynamic URLs in the group, the run will error out."
+        else
+          echo "::notice::Running CI/CD Group for specified input URL: '$TARGET_URL'"
+        fi
+
+        payload=$(jq -n --arg hash "${{ env.COMMIT_HASH }}" --arg branch "${{ env.BRANCH_NAME }}" --arg url "$TARGET_URL" \
+          '{commitHash: $hash, branch: $branch, url: $url}')
+
+        response=$(curl -s -w "%{http_code}" -o response.json -X POST "$api_url" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: apiKey ${{ inputs.SEMATEXT_API_KEY }}" \
+          -d "$payload")
+
+        http_code=$(tail -n1 <<< "$response")
+        if [[ "$http_code" != "201" ]]; then
+          error="Failed to trigger the Sematext check. HTTP status: $http_code"
+          echo "::error::$error"
+          echo "error=$error" >> $GITHUB_OUTPUT
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat response.json
+          exit 1
+        fi
+
+        echo "Check triggered successfully. Extracting Group Run ID..."
+        run_id=$(jq -r '.data.id' response.json)
+        GROUP_RUN_URL="${{ env.GROUP_RUN_URL }}/ui/synthetics/groups/${{ inputs.MONITOR_GROUP_ID }}/runs/$run_id"
+        echo "group_run_url=$GROUP_RUN_URL" >> $GITHUB_OUTPUT
+        if [[ -z "$run_id" ]]; then
+          error="Failed to extract the Group Run ID after triggering the check, unable to poll for results."
+          echo "::error::$error"
+          echo "error=$error" >> $GITHUB_OUTPUT
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat response.json
+          exit 1
+        fi
+
+        echo "Group Run ID: $run_id"
+        echo "::notice::Group Run available at: $GROUP_RUN_URL"
+        echo "run_id=$run_id" >> $GITHUB_ENV
+
+    - name: Poll Sematext for Results
+      id: poll_results
+      shell: bash
+      run: |
+        poll_url="${{ env.BASE_URL }}/groups/${{ inputs.MONITOR_GROUP_ID }}/runs/${{ env.run_id }}/github"
+
+        max_poll_duration=150   # Total allowed polling duration in seconds
+        interval=10             # Wait time between poll attempts in seconds
+        elapsed_time=0          # Counter for total polling time
+
+        sleep 3                 # Initial wait to allow the run to start
+
+        while [[ "$elapsed_time" -lt "$max_poll_duration" ]]; do
+          echo -e " \nPolling Sematext... Elapsed time: ${elapsed_time}s"
+
+          response=$(curl -s -w "%{http_code}" -o result.txt "$poll_url" \
+            -H "Authorization: apiKey ${{ inputs.SEMATEXT_API_KEY }}")
+
+          status_code=$(tail -n1 <<< "$response")
+
+          if [[ "$status_code" == "200" ]]; then
+            echo -e " \nRun completed. Result:"
+            cat result.txt
+
+            # Properly escape the result content for GitHub Actions output
+            result_content=$(cat result.txt)
+            echo "result<<EOF" >> $GITHUB_OUTPUT
+            echo "$result_content" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            
+            first_line=$(head -n 1 result.txt)
+            if echo "$first_line" | grep -q "All monitors passed successfully."; then
+              echo "::notice::Synthetics check passed."
+              echo "status=passed" >> $GITHUB_OUTPUT
+              echo "check_result=passed" >> $GITHUB_ENV
+              exit 0
+            else
+              echo "::error::Synthetics check failed."
+              echo "status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          elif [[ "$status_code" == "202" ]]; then
+            cat result.txt     # Print the current status to see how many monitors are done
+            echo "Retrying in ${interval}s..."
+          else
+            error="Unexpected status code when polling for results: $status_code"
+            echo "::error::$error"
+            echo "error=$error" >> $GITHUB_OUTPUT
+            echo "status=failed" >> $GITHUB_OUTPUT
+            cat result.txt
+
+            result_content=$(cat result.txt)
+            echo "result<<EOF" >> $GITHUB_OUTPUT
+            echo "$result_content" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+
+            exit 1
+          fi
+
+          sleep $interval
+          elapsed_time=$((elapsed_time + interval))
+        done
+
+        error="Polling for results timed out after ${max_poll_duration}s."
+        echo -e "\n::error::$error"
+        echo "error=$error" >> $GITHUB_OUTPUT
+        echo "status=failed" >> $GITHUB_OUTPUT
+
+        result_content=$(cat result.txt)
+        echo "result<<EOF" >> $GITHUB_OUTPUT
+        echo "$result_content" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        exit 1
