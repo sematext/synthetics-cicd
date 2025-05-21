@@ -49,7 +49,7 @@ Since these are Synthetic Monitoring tests, they'll need to run on a live enviro
 | `MONITOR_GROUP_ID` | The ID of the *CI/CD Group* which contains the tests (e.g., `42`) | Yes |
 | `REGION` | The region where your Sematext Cloud account is registered (`EU` or `US`) | Yes |
 | `SEMATEXT_API_KEY` | Your Sematext Cloud account's API key | Yes |
-| `TARGET_URL` | The URL to run the Synthetics tests against - mandatory for monitors with [Dynamic URLs](/docs/synthetics/ci-cd/overview/#dynamic-urls) | No |
+| `TARGET_URL` | The URL to run the Synthetics tests against - mandatory for monitors with [Dynamic URLs](https://sematext.com/docs/synthetics/ci-cd/overview/#dynamic-urls) | No |
 | `GIT_COMMIT_HASH` | The commit hash that the Synthetics tests will be triggered for | No |
 | `USE_HEAD_SHA` | Whether to use the HEAD SHA for the Synthetics tests | No |
 
