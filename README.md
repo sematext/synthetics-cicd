@@ -28,7 +28,7 @@ Add the following to your GitHub workflow file:
 ```yaml
 steps:
   - name: Run Sematext Synthetics Tests
-    uses: sematext/synthetics-cicd@v1.0
+    uses: sematext/synthetics-cicd@v1.0.0
     with:
       MONITOR_GROUP_ID: 42                                          # Replace with your actual Monitor Group ID
       REGION: 'US'                                                  # Replace with your Sematext Cloud account's region ('EU' or 'US')
